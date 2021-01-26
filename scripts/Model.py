@@ -13,17 +13,20 @@ from gpytorch.mlls import VariationalELBO, AddedLossTerm
 from gpytorch.likelihoods import GaussianLikelihood
 import torch.nn.utils.rnn as rnn
 
+
 class NeuroCluster(gpytorch.models.ApproximateGP):
     def __init__(self, ave_arrivals, max_time, class_num=4, num_inducing=32, name_prefix="cox_gp_model"):
         self.name_prefix = name_prefix
         self.max_time = max_time
-
+        self.cluster_ratio = torch.ones(class_num) / class_num
 
         # Define the variational distribution and strategy of the GP
         # We will initialize the inducing points to lie on a grid from 0 to T
         inducing_points = torch.linspace(0, max_time, num_inducing).unsqueeze(-1)
         variational_distribution = gpytorch.variational.CholeskyVariationalDistribution(
-            num_inducing_points=num_inducing)
+            num_inducing_points=num_inducing,
+            batch_shape=torch.Size([class_num])
+        )
         variational_strategy = IndependentMultitaskVariationalStrategy(
             gpytorch.variational.VariationalStrategy(self, inducing_points, variational_distribution),
             num_tasks=class_num
@@ -32,10 +35,11 @@ class NeuroCluster(gpytorch.models.ApproximateGP):
         # Define model
         super().__init__(variational_strategy=variational_strategy)
 
-        self.mean_intensity = torch.nn.Parameter(torch.Tensor([ave_arrivals / max_time]))
+        #self.mean_intensity = torch.nn.Parameter(torch.Tensor([ave_arrivals / max_time]))
+        self.mean_intensity = ave_arrivals / max_time
 
         # Define mean and kernel
-        self.mean_module = gpytorch.means.ZeroMean()
+        self.mean_module = gpytorch.means.ConstantMean()
         self.covar_module = gpytorch.kernels.ScaleKernel(gpytorch.kernels.RBFKernel())
 
     def forward(self, times):
@@ -54,7 +58,7 @@ class NeuroCluster(gpytorch.models.ApproximateGP):
                 function_distribution
             )
 
-    def model(self, arrival_times, quadrature_times):
+    def model(self, arrival_times, quadrature_times, ):
         pyro.module(self.name_prefix + ".gp", self)
         function_distribution = self.pyro_model(torch.cat([arrival_times.data, quadrature_times], -1))
 
@@ -73,18 +77,40 @@ class NeuroCluster(gpytorch.models.ApproximateGP):
 
         # Divide the intensity samples into arrival_intensity_samples and quadrature_intensity_samples
 
-        arrival_intensity_samples, quadrature_intensity_samples = intensity_samples.split(np.cat([
-            arrival_times.batch_sizes.tolist(), [quadrature_times.size(-1)]
-        ]), dim=-1)
+        arrival_intensity_samples, quadrature_intensity_samples = intensity_samples.split([
+            arrival_times.data.size(-1), quadrature_times.size(-1)
+        ], dim=-1)
 
+        data_likelihood = torch.stack([each_data.log().sum(dim=-1)
+                                       for each_data
+                                       in arrival_intensity_samples.split(arrival_times.batch_sizes, dim=-1)],
+                                      )
         ####
         # Compute the log_likelihood, using the method described above
         ####
 
-        arrival_log_intensities = arrival_intensity_samples.log().sum(dim=-1)
-
         est_num_arrivals = quadrature_intensity_samples.mean(dim=-1).mul(self.max_time)
 
-        log_likelihood = arrival_log_intensities - est_num_arrivals
+        if data_likelihood.ndim == 3:
+            # data_likelihood : (batch, particle, cluster)
+            # cluster_ratio : (batch, cluster)
+            # est_num_arrivals : (particle, cluster)
+            cluster_log_likelihood = data_likelihood - est_num_arrivals.unsqueeze(0)
 
-        pyro.factor(self.name_prefix + ".log_likelihood", log_likelihood)
+        else:
+            # data_likelihood : (batch, cluster)
+            # cluster_ratio : (batch, cluster)
+            # est_num_arrivals : (cluster)
+            cluster_log_likelihood = (data_likelihood - est_num_arrivals.unsqueeze(0)).unsqueeze(1)
+
+        # cluster_log_likelihood : (batch, particle, cluster)
+        # estimated_cluster : (batch, cluster)
+        with torch.no_grad():
+            log_ratio = cluster_log_likelihood.mean(dim=1) + self.cluster_ratio.log().unsqueeze(0)
+            estimated_cluster = log_ratio - torch.logsumexp(log_ratio, dim=0, keepdim=True)
+            estimated_cluster = estimated_cluster / estimated_cluster.sum(dim=1, keepdim=True)
+            self.cluster_ratio = estimated_cluster.mean(dim=0)
+
+        log_likelihood = (cluster_log_likelihood * estimated_cluster.unsqueeze(1)).sum(dim=-1)
+
+        pyro.factor(self.name_prefix + ".log_likelihood", log_likelihood.t())
